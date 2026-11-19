@@ -288,20 +288,20 @@ async function main() {
   const payload = {
     username: 'Tibia Daily', allowed_mentions: { parse: [] },
     embeds: [{
-      title: `📅 Tibia Daily — ${WORLD} — ${formatted(today)}`,
-      description: `Server day: ${formatted(today)} • Posts after regular server save`,
+      title: `📅 Tibia Daily ${formatted(today)}`,
+      description: `Server day: ${formatted(today)}`,
       color: 0x2a9d8f,
       fields: [
         { name: '🐉 Boosted Creature', value: safe(boost.creature), inline: true },
         { name: '💀 Boosted Boss', value: safe(boost.boss), inline: true },
         { name: '🧳 Rashid', value: rashid[weekday], inline: true },
-        { name: '⚔️ Ichgahal — previous reported day (Kanda)', value: kills, inline: true },
-        { name: '🌙 Dream Courts / Dream Scar — Kanda', value: safe(dream), inline: true },
+        { name: '⚔️ Ichgahal — last day kills', value: kills, inline: true },
+        { name: '🌙 Dream Courts', value: safe(dream), inline: true },
         { name: '🏟️ Tibiadrome', value: drome() },
         { name: '🎉 Active Events', value: displayEvents(active, 'active') },
         { name: '📅 Upcoming Events (28 days)', value: displayEvents(upcoming, 'upcoming') },
       ],
-      footer: { text: `Boosts: ${boost.source}${boost.verified ? '' : ' (today not independently verified)'} • Events: ${eventsData.source}`.slice(0, 2048) },
+      footer: { text: `Boosts: ${boost.source} • Events: ${eventsData.source}`.slice(0, 2048) },
       timestamp: now.toISOString(),
     }],
   };
