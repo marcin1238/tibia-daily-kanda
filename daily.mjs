@@ -299,7 +299,7 @@ async function main() {
         { name: '🌙 Dream Courts', value: safe(dream), inline: true },
         { name: '🏟️ Tibiadrome', value: drome() },
         { name: '🎉 Active Events', value: displayEvents(active, 'active') },
-        { name: '📅 Upcoming Events (28 days)', value: displayEvents(upcoming, 'upcoming') },
+        // { name: '📅 Upcoming Events (28 days)', value: displayEvents(upcoming, 'upcoming') },
       ],
       footer: { text: `Boosts: ${boost.source} • Events: ${eventsData.source}`.slice(0, 2048) },
       timestamp: now.toISOString(),
