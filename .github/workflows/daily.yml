@@ -1,0 +1,28 @@
+name: Tibia Daily - Kanda
+
+on:
+  schedule:
+    - cron: '10 10 * * *'
+      timezone: 'Europe/Warsaw'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tibia-daily-kanda
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Post Tibia Daily
+        run: node daily.mjs
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
