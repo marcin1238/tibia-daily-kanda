@@ -1,117 +1,134 @@
 import * as cheerio from 'cheerio';
 
-const API = 'https://api.tibiadata.com/v5';
 const WORLD = 'Kanda';
-const TIMEZONE = 'Europe/Warsaw';
-const CALENDAR = 'https://www.tibia.com/news/?subtopic=eventcalendar';
-const WIKI = 'https://tibia.fandom.com/wiki/Dream_Scar/Boss_of_the_Day';
-const webhook = process.env.DISCORD_WEBHOOK_URL;
-if (!webhook && process.env.DRY_RUN !== '1') throw new Error('Missing DISCORD_WEBHOOK_URL');
-const now = new Date();
-const clean = v => String(v ?? '').replace(/\s+/g, ' ').trim();
-const safe = v => clean(v).replace(/([*_`~|])/g, '\\$1').replace(/@/g, '@\u200b');
+const API = 'https://api.tibiadata.com/v5';
+const OFFICIAL_CALENDAR = 'https://www.tibia.com/news/?subtopic=eventcalendar';
+const FALLBACK_EVENTS = 'https://tibia.gg/en/articles/events';
+const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+const now = process.env.TEST_NOW ? new Date(process.env.TEST_NOW) : new Date();
+const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+const safe = value => clean(value).replace(/([*_`~|])/g, '\\$1').replace(/@/g, '@\u200b');
 const iso = d => d.toISOString().slice(0, 10);
-const plusDays = (date, delta) => iso(new Date(new Date(`${date}T12:00:00Z`).getTime() + delta * 86400000));
-const parts = new Intl.DateTimeFormat('en-GB', {
-  timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long',
+const plusDays = (date, days) => iso(new Date(Date.parse(`${date}T12:00:00Z`) + days * 86400000));
+const formatted = date => new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${date}T12:00:00Z`));
+const warsaw = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23',
 }).formatToParts(now);
-const p = type => parts.find(x => x.type === type)?.value;
-const today = `${p('year')}-${p('month')}-${p('day')}`;
-const fmt = date => new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${date}T12:00:00Z`));
+const part = kind => warsaw.find(p => p.type === kind)?.value;
+const wallDate = `${part('year')}-${part('month')}-${part('day')}`;
+// Tibia's day rolls over at the regular 10:00 CET/CEST server save, not at midnight.
+const today = Number(part('hour')) >= 10 ? wallDate : plusDays(wallDate, -1);
+const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: 'UTC' }).format(new Date(`${today}T12:00:00Z`));
 
-async function fetchData(url, json = false) {
+async function get(url, json = false) {
   const res = await fetch(url, {
-    headers: { Accept: json ? 'application/json' : 'text/html', 'Cache-Control': 'no-cache', 'User-Agent': 'TibiaDailyKanda/2.0' },
-    cache: 'no-store', signal: AbortSignal.timeout(20000),
+    headers: {
+      Accept: json ? 'application/json' : 'text/html,application/xhtml+xml',
+      'Cache-Control': 'no-cache',
+      'User-Agent': 'Mozilla/5.0 (compatible; KandaDaily/3.0; +https://github.com)',
+    },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(18000),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} (${new URL(url).hostname})`);
+  if (!res.ok) throw new Error(`${new URL(url).hostname} HTTP ${res.status}`);
   return json ? res.json() : res.text();
 }
-const api = path => fetchData(`${API}${path}`, true);
-async function optional(label, fn, fallback) {
-  try { return await fn(); } catch (e) { console.warn(`${label}: ${e.message}`); return fallback; }
+const api = path => get(`${API}${path}`, true);
+async function attempt(label, fn, fallback = null) {
+  try { return await fn(); }
+  catch (e) { console.warn(`[${label}] ${e.message}`); return fallback; }
+}
+
+// Tibia.com puts the two boosted values in the page's RightArtwork header.
+// These selectors match the ones used by the actively maintained Tibia.py parser.
+function parseOfficialBoosts(html) {
+  const $ = cheerio.load(html);
+  const parse = id => clean($(`#RightArtwork #${id}, #${id}`).first().attr('title'))
+    .replace(/^Today.s boosted (?:creature|boss):\s*/i, '').trim();
+  const creature = parse('Monster');
+  const boss = parse('Boss');
+  if (!creature || !boss) throw new Error('Missing #Monster or #Boss header data');
+  return { creature, boss, source: 'tibia.com', verified: true };
 }
 
 async function boosted() {
-  // Prefer live Tibia.com because TibiaData/CDN may still contain yesterday's data.
-  const official = await optional('Official boosts', async () => {
-    const $ = cheerio.load(await fetchData('https://www.tibia.com/library/?subtopic=creatures'));
-    const find = kind => {
-      const el = $('img[title]').filter((_, item) => new RegExp(`today.s boosted ${kind}`, 'i').test($(item).attr('title') ?? '')).first();
-      return clean((el.attr('title') ?? '').replace(new RegExp(`^today.s boosted ${kind}:?\\s*`, 'i'), ''));
-    };
-    const creature = find('creature'), boss = find('boss');
-    if (!creature || !boss) throw new Error('Boost data not found on official page');
-    return { creature, boss, source: 'tibia.com' };
-  }, null);
-  const tibiadata = await optional('TibiaData boosts', async () => {
-    const [c, b] = await Promise.all([api('/creatures'), api('/boostablebosses')]);
-    const creature = clean(c.creatures?.boosted?.name), boss = clean(b.boostable_bosses?.boosted?.name);
-    if (!creature || !boss) throw new Error('Invalid API response');
-    return { creature, boss, source: 'TibiaData (cached/unverified)' };
-  }, null);
-  if (official && tibiadata && (official.creature.toLowerCase() !== tibiadata.creature.toLowerCase() || official.boss.toLowerCase() !== tibiadata.boss.toLowerCase())) {
-    console.warn('Boost mismatch! Official:', official, 'API:', tibiadata);
-  }
-  return official ?? tibiadata ?? { creature: 'Unavailable', boss: 'Unavailable', source: 'Unavailable' };
+  const official = await attempt('Official boosts', async () => {
+    const html = await get('https://www.tibia.com/library/?subtopic=creatures');
+    return parseOfficialBoosts(html);
+  });
+  if (official) return official;
+  const fallback = await attempt('TibiaData boosts', async () => {
+    const [creatures, bosses] = await Promise.all([api('/creatures'), api('/boostablebosses')]);
+    const creature = clean(creatures.creatures?.boosted?.name);
+    const boss = clean(bosses.boostable_bosses?.boosted?.name);
+    if (!creature || !boss) throw new Error('Missing boosted values');
+    return { creature, boss, source: 'TibiaData (cached)', verified: false };
+  });
+  return fallback ?? { creature: 'Unavailable', boss: 'Unavailable', source: 'unavailable', verified: false };
 }
 
 async function ichgahal() {
   const entries = (await api(`/killstatistics/${WORLD}`)).killstatistics?.entries;
   if (!Array.isArray(entries)) throw new Error('Bad kill statistics response');
-  const boss = entries.find(e => clean(e.race).toLowerCase() === 'ichgahal');
-  return Number.isInteger(boss?.last_day_killed) ? `${boss.last_day_killed.toLocaleString('en-US')} kills` : 'Unavailable (not listed)';
+  const record = entries.find(entry => clean(entry.race).toLowerCase() === 'ichgahal');
+  return Number.isInteger(record?.last_day_killed)
+    ? `${record.last_day_killed.toLocaleString('en-US')} kills`
+    : 'No previous-day record supplied by API';
 }
 
 function drome() {
-  // Rotation #140 began 2026-11-11 08:00 UTC; each rotation lasts 14 days.
-  const base = Date.parse('2026-11-11T08:00:00Z');
-  const interval = 14 * 86400000;
-  const index = Math.floor((Date.now() - base) / interval);
-  const end = new Date(base + (index + 1) * interval);
-  const hoursLeft = Math.max(0, Math.ceil((end.getTime() - Date.now()) / 3600000));
-  return `Rotation **#${140 + index}** • Next reset **${fmt(iso(end))}** (${Math.floor(hoursLeft / 24)}d ${hoursLeft % 24}h)\nModifiers are randomized: check the board in-game.`;
+  // Publicly documented rotation #140 ends at the server save on 25 Nov 2026.
+  const base = Date.parse('2026-11-11T09:00:00Z');
+  const duration = 14 * 86400000;
+  const index = Math.floor((now.getTime() - base) / duration);
+  const reset = new Date(base + (index + 1) * duration);
+  const hoursLeft = Math.max(0, Math.ceil((reset.getTime() - now.getTime()) / 3600000));
+  return `Rotation **#${140 + index}** • Next reset **${formatted(iso(reset))}** (${Math.floor(hoursLeft / 24)}d ${hoursLeft % 24}h)\nModifiers are randomized; check the board in-game.`;
 }
 
 async function dreamScar() {
+  // Still community-maintained, not an official Kanda API. Report this qualification.
   const urls = [
     'https://tibia.fandom.com/api.php?action=parse&page=Dream_Scar%2FBoss_of_the_Day&prop=text&format=json',
-    `${WIKI}?_=${Date.now()}`,
+    'https://tibia.fandom.com/wiki/Dream_Scar/Boss_of_the_Day',
   ];
-  const allowed = ['Plagueroot', 'Malofur Mangrinder', 'Maxxenius', 'Alptramun', 'Izcandar the Banished'];
+  const allowed = new Set(['Plagueroot', 'Malofur Mangrinder', 'Maxxenius', 'Alptramun', 'Izcandar the Banished']);
   for (const url of urls) {
     try {
-      const html = url.includes('/api.php') ? (await fetchData(url, true)).parse?.text?.['*'] : await fetchData(url);
-      if (!html) throw new Error('No rendered wiki content');
-      const $ = cheerio.load(html);
+      const html = url.includes('/api.php') ? (await get(url, true)).parse?.text?.['*'] : await get(url);
+      const $ = cheerio.load(html ?? '');
       const wikiDay = clean($('body').text()).match(/Today is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1];
-      const expectedDay = new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: 'Etc/GMT+8' }).format(now);
-      if (wikiDay?.toLowerCase() !== expectedDay.toLowerCase()) throw new Error(`Stale wiki date (${wikiDay || 'missing'})`);
+      if (!wikiDay || wikiDay.toLowerCase() !== weekday.toLowerCase()) {
+        throw new Error(`Wiki date not confirmed for ${weekday} (reported ${wikiDay ?? 'missing'})`);
+      }
       let boss;
-      $('tr').each((_, row) => {
-        const cells = $(row).find('th,td').map((_, el) => clean($(el).text())).get();
+      $('tr').each((_, el) => {
+        const cells = $(el).find('td, th').map((_, c) => clean($(c).text())).get();
         if (cells[0] === WORLD) boss = cells[1];
       });
-      if (!allowed.includes(boss)) throw new Error('Kanda boss unavailable');
-      return `${boss} (community-maintained)`;
-    } catch (e) { console.warn(`Dream Scar: ${e.message}`); }
+      if (!allowed.has(boss)) throw new Error('Kanda boss absent');
+      return `${boss} (community table; confirm in-game)`;
+    } catch (e) { console.warn(`[Dream Scar] ${e.message}`); }
   }
-  return 'Unverified for Kanda today';
+  return 'Not verifiable for Kanda today';
 }
 
-// Tibia's official calendar stores daily event titles/descriptions inside hover popups.
+// Official Tibia calendar: each day contains a HelperDivIndicator popup, whose
+// onmouseover JS embeds pairs of HTML divs: title followed by description.
 function parsePopups($, cell) {
   const result = [];
-  $(cell).find('span.HelperDivIndicator[onmouseover]').each((_, el) => {
-    const attr = $(el).attr('onmouseover') || '';
-    const first = attr.indexOf(','), second = attr.indexOf(',', first + 1);
-    if (second < 0) return;
-    let html = attr.slice(second + 1).replace(/,?\s*\);?\s*$/, '').trim();
-    if (html.startsWith("'")) html = html.slice(1);
-    if (html.endsWith("'")) html = html.slice(0, -1);
-    html = html.replace(/\\'/g, "'").replace(/\\"/g, '"');
+  $(cell).find('span.HelperDivIndicator[onmouseover]').each((_, element) => {
+    const raw = $(element).attr('onmouseover') ?? '';
+    const first = raw.indexOf(',');
+    const second = raw.indexOf(',', first + 1);
+    if (first < 0 || second < 0) return;
+    const html = raw.slice(second + 1)
+      .replace(/,\s*\);?\s*$/, '')
+      .replace(/\\'/g, '"')
+      .replace(/'/g, '')
+      .trim();
     const nested = cheerio.load(`<section>${html}</section>`);
-    const divs = nested('section div').map((_, div) => clean(nested(div).text())).get();
+    const divs = nested('section div').map((_, el) => clean(nested(el).text())).get();
     for (let i = 0; i + 1 < divs.length; i += 2) {
       if (divs[i]) result.push({ title: divs[i].replace(/:$/, ''), description: divs[i + 1].replace(/^•\s*/, '') });
     }
@@ -119,109 +136,183 @@ function parsePopups($, cell) {
   return result;
 }
 
-function parseCalendar(html) {
+function parseOfficialCalendar(html) {
   const $ = cheerio.load(html);
-  const header = clean($('.eventscheduleheaderdateblock').first().text());
+  const header = clean($('div.eventscheduleheaderdateblock').first().text());
   const match = header.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/i);
-  if (!match || !$('#eventscheduletable').length) throw new Error('Unrecognized calendar HTML');
+  if (!match || !$('#eventscheduletable').length) throw new Error('Unknown Tibia calendar HTML');
   let month = new Date(`${match[1]} 1, ${match[2]} 12:00:00 GMT`).getUTCMonth() + 1;
-  let year = Number(match[2]), expected = 1;
+  let year = Number(match[2]);
+  let expected = 1;
   const days = [];
   $('#eventscheduletable td').each((_, cell) => {
-    const day = Number(clean($(cell).find('div').first().text()));
-    if (!Number.isInteger(day) || day < 1 || day > 31) return;
-    if (expected < day) { month--; if (month < 1) { month = 12; year--; } }
-    else if (day < expected) { month++; if (month > 12) { month = 1; year++; } }
-    expected = day + 1;
-    const date = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    days.push({ date, entries: parsePopups($, cell) });
+    const number = Number(clean($(cell).find('div').first().text()));
+    if (!Number.isInteger(number) || number < 1 || number > 31) return;
+    if (expected < number) { month--; if (month === 0) { month = 12; year--; } }
+    else if (number < expected) { month++; if (month === 13) { month = 1; year++; } }
+    expected = number + 1;
+    days.push({ date: `${year}-${String(month).padStart(2, '0')}-${String(number).padStart(2, '0')}`, entries: parsePopups($, cell) });
   });
-  if (days.length < 20) throw new Error('Calendar incomplete');
-  if (html.includes('HelperDivIndicator') && !days.some(d => d.entries.length)) throw new Error('Event popups could not be decoded');
+  if (days.length < 28) throw new Error(`Only ${days.length} calendar dates decoded`);
+  if (html.includes('HelperDivIndicator') && !days.some(d => d.entries.length)) {
+    throw new Error('Event popups were not decoded');
+  }
   return days;
 }
 
-async function getEvents() {
-  const [year, month] = today.split('-').map(Number);
-  const next = new Date(Date.UTC(year, month, 1));
-  const months = [[year, month], [next.getUTCFullYear(), next.getUTCMonth() + 1]];
-  const pages = await Promise.all(months.map(async ([y, m]) => optional(`Events ${y}-${m}`, () => fetchData(`${CALENDAR}&calendarmonth=${m}&calendaryear=${y}`).then(parseCalendar), null)));
-  if (!pages.some(Boolean)) throw new Error('Could not fetch any official calendars');
-  const unique = new Map();
-  for (const page of pages.filter(Boolean)) for (const day of page) for (const event of day.entries) {
-    const key = `${event.title}|${event.description}`.toLowerCase();
-    if (!unique.has(key)) unique.set(key, { ...event, days: new Set() });
-    unique.get(key).days.add(day.date);
+function normalizeTitle(title) {
+  const str = clean(title).toLowerCase();
+  if (/^(xp\/skill event|double xp.*skill|double experience.*skill)$/.test(str)) return 'double-experience-and-skill';
+  return str.replace(/[^a-z0-9]/g, '');
+}
+
+function eventsFromDays(days) {
+  const map = new Map();
+  for (const day of days) for (const entry of day.entries) {
+    const key = normalizeTitle(entry.title);
+    if (!map.has(key)) map.set(key, { title: key === 'double-experience-and-skill' ? 'Double Experience and Skill' : entry.title, description: entry.description, days: new Set() });
+    map.get(key).days.add(day.date);
   }
-  const active = [], upcoming = [], horizon = plusDays(today, 28);
-  for (const event of unique.values()) {
-    const days = [...event.days].sort();
-    if (!days.length) continue;
-    let group = [days[0]];
+  const result = [];
+  for (const event of map.values()) {
+    const sorted = [...event.days].sort();
+    if (!sorted.length) continue;
+    let group = [sorted[0]];
     const emit = () => {
-      const start = group[0], end = group.at(-1);
-      const entry = { title: event.title, description: event.description, start, end };
-      if (start <= today && end >= today) active.push(entry);
-      else if (start > today && start <= horizon) upcoming.push(entry);
+      // The last calendar date is the server-save end date (end-exclusive).
+      result.push({ title: event.title, description: event.description, start: group[0], end: group.at(-1) });
     };
-    for (const day of days.slice(1)) {
-      if (plusDays(group.at(-1), 1) === day) group.push(day);
-      else { emit(); group = [day]; }
+    for (const d of sorted.slice(1)) {
+      if (plusDays(group.at(-1), 1) === d) group.push(d);
+      else { emit(); group = [d]; }
     }
     emit();
   }
-  active.sort((a,b) => a.end.localeCompare(b.end));
-  upcoming.sort((a,b) => a.start.localeCompare(b.start));
-  return { active, upcoming };
+  return result;
 }
 
-function showEvents(events, mode) {
-  if (!events.length) return mode === 'active' ? 'No active events listed' : 'No upcoming events listed in 28 days';
-  const lines = events.slice(0, 5).map(event => {
-    const label = mode === 'active' ? `until ${fmt(event.end)}` : `starts ${fmt(event.start)}`;
-    return `• **${safe(event.title)}** — ${label}\n  ${safe(event.description).slice(0, 130)}`;
+async function officialEvents() {
+  const [year, month] = today.split('-').map(Number);
+  const next = new Date(Date.UTC(year, month, 1));
+  const pages = await Promise.all([
+    [year, month], [next.getUTCFullYear(), next.getUTCMonth() + 1],
+  ].map(async ([y, m]) => attempt(`Official events ${y}-${m}`,
+    async () => parseOfficialCalendar(await get(`${OFFICIAL_CALENDAR}&calendarmonth=${m}&calendaryear=${y}`)),
+    null)));
+  if (!pages.some(Boolean)) throw new Error('Official website blocked or HTML structure changed');
+  const events = eventsFromDays(pages.filter(Boolean).flat());
+  if (!events.length) throw new Error('No events found on official calendar');
+  return { events, source: 'Tibia.com calendar' };
+}
+
+// TibiaGG publishes an explicitly dated yearly table as a fallback.
+// We deliberately do NOT project yearly events into a different year.
+function parseTibiaGGEvents(html) {
+  const $ = cheerio.load(html);
+  const text = clean($.root().text());
+  const year = Number(text.match(/yearly events of (20\d\d)/i)?.[1]);
+  if (!year) throw new Error('Could not establish source year');
+  const months = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  const date = (name, day, y) => `${y}-${String(months[name.toLowerCase()]).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const events = [];
+  $('table tr').each((_, tr) => {
+    const cells = $(tr).find('td').map((_, td) => clean($(td).text())).get();
+    if (cells.length < 3) return;
+    const match = cells[0].match(/^([A-Za-z]{3})\s+(\d{1,2})\s*[–-]\s*(?:([A-Za-z]{3})\s+)?(\d{1,2})$/);
+    if (!match || !months[match[1].toLowerCase()] || (match[3] && !months[match[3].toLowerCase()])) return;
+    const start = date(match[1], match[2], year);
+    const end = date(match[3] || match[1], match[4], (match[3] && months[match[3].toLowerCase()] < months[match[1].toLowerCase()]) ? year + 1 : year);
+    if (start >= end) return;
+    events.push({ title: cells[1], description: cells[2], start, end });
   });
-  if (events.length > 5) lines.push(`…and ${events.length - 5} more`);
+  if (events.length < 10) throw new Error(`Only ${events.length} dated events parsed`);
+  return events;
+}
+
+// Captured from the official November 2026 calendar, for situations in which
+// both live event sources block automated HTTP requests. These dates expire.
+const OFFICIAL_2026_FALLBACK = [
+  { title: 'Double Experience and Skill', start: '2026-11-20', end: '2026-11-23', description: 'Double XP and skills' },
+  { title: 'Last Creep Standing', start: '2026-11-20', end: '2026-11-25', description: 'Scheduled Tibia event' },
+  { title: 'Rapid Respawn', start: '2026-12-04', end: '2026-12-07', description: 'Faster creature respawns' },
+];
+
+async function getEvents() {
+  const official = await attempt('Official event calendar', officialEvents);
+  if (official) return official;
+  const fallback = await attempt('TibiaGG events', async () => parseTibiaGGEvents(await get(FALLBACK_EVENTS)), []);
+  // Merge any available live yearly-table dates with 2026 events observed on official page.
+  const map = new Map();
+  for (const event of [...fallback, ...OFFICIAL_2026_FALLBACK]) {
+    const key = `${normalizeTitle(event.title)}|${event.start}`;
+    // The official snapshot wins when both sources describe the same occurrence.
+    map.set(key, event);
+  }
+  return { events: [...map.values()], source: fallback.length ? 'TibiaGG yearly table + official 2026 snapshot' : 'official Nov/Dec 2026 snapshot (limited)' };
+}
+
+function eventsByStatus(all) {
+  const horizon = plusDays(today, 28);
+  const active = [], upcoming = [];
+  for (const e of all) {
+    if (e.start <= today && today < e.end) active.push(e);
+    else if (today < e.start && e.start <= horizon) upcoming.push(e);
+  }
+  active.sort((a, b) => a.end.localeCompare(b.end));
+  upcoming.sort((a, b) => a.start.localeCompare(b.start));
+  return { active, upcoming };
+}
+function displayEvents(events, type) {
+  if (!events.length) return type === 'active' ? 'No active events found' : 'No upcoming events found within 28 days';
+  let lines = events.slice(0, 6).map(e => {
+    const when = type === 'active' ? `ends ${formatted(e.end)} at server save` : `starts ${formatted(e.start)}`;
+    return `• **${safe(e.title)}** — ${when}${e.description ? `\n  ${safe(e.description).slice(0, 90)}` : ''}`;
+  });
+  if (events.length > 6) lines.push(`…plus ${events.length - 6} more`);
   return lines.join('\n').slice(0, 1024);
 }
 
 async function main() {
-  const [todayBoost, kills, dream, events] = await Promise.all([
+  if (!WEBHOOK && process.env.DRY_RUN !== '1') throw new Error('Missing DISCORD_WEBHOOK_URL');
+  const [boost, kills, dream, eventsData] = await Promise.all([
     boosted(),
-    optional('Ichgahal kills', ichgahal, 'Unavailable (API error)'),
-    optional('Dream Scar', dreamScar, 'Unverified for Kanda today'),
-    optional('Events', getEvents, null),
+    attempt('Ichgahal', ichgahal, 'Unavailable (API error)'),
+    attempt('Dream Scar', dreamScar, 'Not verifiable for Kanda today'),
+    getEvents(),
   ]);
+  const { active, upcoming } = eventsByStatus(eventsData.events);
   const rashid = {
     Monday: 'Svargrond', Tuesday: 'Liberty Bay', Wednesday: 'Port Hope',
     Thursday: 'Ankrahmun', Friday: 'Darashia', Saturday: 'Edron', Sunday: 'Carlin',
   };
-  const boostLabel = todayBoost.source === 'tibia.com' ? 'TODAY' : 'FRESHNESS NOT VERIFIED';
   const payload = {
     username: 'Tibia Daily', allowed_mentions: { parse: [] },
     embeds: [{
-      title: `📅 Tibia Daily — Kanda — ${fmt(today)}`,
-      description: 'Current Tibia server day, following server save.',
+      title: `📅 Tibia Daily — ${WORLD} — ${formatted(today)}`,
+      description: `Server day: ${formatted(today)} • Posts after regular server save`,
       color: 0x2a9d8f,
       fields: [
-        { name: `🐉 Boosted Creature — ${boostLabel}`, value: safe(todayBoost.creature), inline: true },
-        { name: `💀 Boosted Boss — ${boostLabel}`, value: safe(todayBoost.boss), inline: true },
-        { name: '🧳 Rashid — TODAY', value: rashid[p('weekday')], inline: true },
-        { name: '⚔️ Ichgahal — PREVIOUS reported day (Kanda)', value: kills, inline: true },
+        { name: '🐉 Boosted Creature', value: safe(boost.creature), inline: true },
+        { name: '💀 Boosted Boss', value: safe(boost.boss), inline: true },
+        { name: '🧳 Rashid', value: rashid[weekday], inline: true },
+        { name: '⚔️ Ichgahal — previous reported day (Kanda)', value: kills, inline: true },
         { name: '🌙 Dream Courts / Dream Scar — Kanda', value: safe(dream), inline: true },
         { name: '🏟️ Tibiadrome', value: drome() },
-        { name: '🎉 Active Events', value: events ? showEvents(events.active, 'active') : 'Unavailable (calendar could not be read)' },
-        { name: '📅 Upcoming Events (28 days)', value: events ? showEvents(events.upcoming, 'upcoming') : 'Unavailable (calendar could not be read)' },
+        { name: '🎉 Active Events', value: displayEvents(active, 'active') },
+        { name: '📅 Upcoming Events (28 days)', value: displayEvents(upcoming, 'upcoming') },
       ],
-      footer: { text: `Kanda • Boost source: ${todayBoost.source} • Event source: Tibia.com` },
+      footer: { text: `Boosts: ${boost.source}${boost.verified ? '' : ' (today not independently verified)'} • Events: ${eventsData.source}`.slice(0, 2048) },
       timestamp: now.toISOString(),
     }],
   };
   if (process.env.DRY_RUN === '1') { console.log(JSON.stringify(payload, null, 2)); return; }
-  const res = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`Discord webhook HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  console.log(`Daily posted for ${WORLD}. Boost source: ${todayBoost.source}`);
+  const res = await fetch(WEBHOOK, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload), signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`Discord HTTP ${res.status}: ${(await res.text()).slice(0, 180)}`);
+  console.log(`Posted ${today}; boosts ${boost.source}; events ${eventsData.source}`);
 }
 
 if (process.env.DAILY_TEST_IMPORT !== '1') await main();
-export { parsePopups, parseCalendar, showEvents, drome, plusDays, getEvents };
+export { parseOfficialBoosts, parsePopups, parseOfficialCalendar, parseTibiaGGEvents, eventsFromDays, eventsByStatus, displayEvents, plusDays, today };
