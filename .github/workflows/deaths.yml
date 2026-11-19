@@ -1,0 +1,53 @@
+name: Kanda - Death Tracker
+
+on:
+  schedule:
+    - cron: '3-59/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Needed to save the last-seen checkpoint in this repo
+
+concurrency:
+  group: kanda-death-tracker
+  cancel-in-progress: false
+
+jobs:
+  check-deaths:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install existing project dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check Kanda deaths and notify Discord
+        run: node deaths.mjs
+        env:
+          DISCORD_DEATHS_WEBHOOK_URL: ${{ secrets.DISCORD_DEATHS_WEBHOOK_URL }}
+
+      - name: Save death-tracker checkpoint
+        if: always()
+        run: |
+          if [ ! -f .kanda-deaths-state.json ]; then
+            echo "No checkpoint file to save."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .kanda-deaths-state.json
+          if git diff --cached --quiet; then
+            echo "No new deaths / no checkpoint changes."
+            exit 0
+          fi
+          git commit -m "chore: update Kanda death checkpoint [skip ci]"
+          git push
