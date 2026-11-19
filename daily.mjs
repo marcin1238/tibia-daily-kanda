@@ -83,7 +83,7 @@ function drome() {
   const index = Math.floor((now.getTime() - base) / duration);
   const reset = new Date(base + (index + 1) * duration);
   const hoursLeft = Math.max(0, Math.ceil((reset.getTime() - now.getTime()) / 3600000));
-  return `Rotation **#${140 + index}** • Next reset **${formatted(iso(reset))}** (${Math.floor(hoursLeft / 24)}d ${hoursLeft % 24}h)\nModifiers are randomized; check the board in-game.`;
+  return `Rotation **#${140 + index}** • Next reset **${formatted(iso(reset))}** (${Math.floor(hoursLeft / 24)}d ${hoursLeft % 24}h)`;
 }
 
 async function dreamScar() {
@@ -107,7 +107,7 @@ async function dreamScar() {
         if (cells[0] === WORLD) boss = cells[1];
       });
       if (!allowed.has(boss)) throw new Error('Kanda boss absent');
-      return `${boss} (community table; confirm in-game)`;
+      return `${boss}`;
     } catch (e) { console.warn(`[Dream Scar] ${e.message}`); }
   }
   return 'Not verifiable for Kanda today';
